@@ -5,11 +5,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-
 EXPERIMENTS_PATH = Path("experiments.csv")
 
 
 def load_experiments() -> pd.DataFrame:
+    """Load experiments from CSV, or return an empty DataFrame with the right columns."""
     if not EXPERIMENTS_PATH.exists():
         return pd.DataFrame(
             columns=[
@@ -29,6 +29,7 @@ def load_experiments() -> pd.DataFrame:
 def run_experiment(task: str, model_name: str, quantization: str, device: str) -> str:
     """
     Run runner.py with the selected options and return the combined stdout/stderr.
+    NOTE: device must be one of: auto, cpu, gpu (matches runner.py argparse).
     """
     cmd = [
         sys.executable,
@@ -51,10 +52,14 @@ def run_experiment(task: str, model_name: str, quantization: str, device: str) -
 
     output = []
     output.append("COMMAND: " + " ".join(cmd))
+
     if result.stdout:
         output.append("\nSTDOUT:\n" + result.stdout)
     if result.stderr:
         output.append("\nSTDERR:\n" + result.stderr)
+
+    if result.returncode != 0:
+        output.append(f"\n[EXIT CODE: {result.returncode}]")
 
     return "\n".join(output)
 
@@ -82,7 +87,10 @@ Use this dashboard to:
 
 df = load_experiments()
 
+# ──────────────────────────────────────────────────────────────────────────────
 # Sidebar controls
+# ──────────────────────────────────────────────────────────────────────────────
+
 st.sidebar.header("Experiment configuration")
 
 task = st.sidebar.selectbox(
@@ -113,17 +121,21 @@ quantization = st.sidebar.selectbox(
     index=0,
 )
 
+# IMPORTANT: choices must match runner.py argparse: auto, cpu, gpu
 device_choice = st.sidebar.selectbox(
     "Device",
-    options=["auto", "cuda", "cpu"],
+    options=["auto", "gpu", "cpu"],
     index=0,
-    help="For int8/int4, GPU (auto/cuda) is recommended.",
+    help="For int8/int4, GPU (auto) is recommended.",
 )
 
-# Guard: int8/int4 on CPU is not supported in your pipeline
 device_to_use = device_choice
+
+# Your pipeline: bitsandbytes 4/8-bit needs GPU; force auto if CPU selected
 if quantization in ("int8", "int4") and device_choice == "cpu":
-    st.sidebar.warning("int8/int4 on CPU not supported – using 'auto' (GPU) instead.")
+    st.sidebar.warning(
+        "int8/int4 on CPU is not supported in this setup – using 'auto' (GPU) instead."
+    )
     device_to_use = "auto"
 
 st.sidebar.markdown("---")
@@ -147,6 +159,10 @@ if run_button:
 
     # Reload experiments after new run
     df = load_experiments()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Experiments table + filters
+# ──────────────────────────────────────────────────────────────────────────────
 
 st.markdown("## 📊 Current experiments")
 
@@ -177,6 +193,7 @@ else:
         )
 
     df_filt = df.copy()
+
     if filt_task != "(all)":
         df_filt = df_filt[df_filt["task"] == filt_task]
     if filt_model != "(all)":
@@ -187,33 +204,92 @@ else:
     st.dataframe(df_filt, use_container_width=True)
 
     # ──────────────────────────────────────────────────────────────────────
-    # Charts: accuracy, latency, emissions vs model & quantization
+    # Charts: before vs after quantization (CUDA runs only)
     # ──────────────────────────────────────────────────────────────────────
     st.markdown("### Charts")
 
     if not df_filt.empty:
         import altair as alt
 
-        base = alt.Chart(df_filt).encode(
-            x=alt.X("model_name:N", title="Model"),
-            color=alt.Color("quantization:N", title="Quantization"),
-            column=alt.Column("task:N", title="Task"),
-        )
+        # Only CUDA runs (auto/gpu in runner show up as 'cuda' in CSV)
+        df_cuda = df_filt[df_filt["device"] == "cuda"].copy()
 
-        acc_chart = base.mark_bar().encode(
-            y=alt.Y("accuracy:Q", title="Accuracy"),
-        ).properties(title="Accuracy by model & quantization")
+        if df_cuda.empty:
+            st.info("No CUDA runs found for the current filters.")
+        else:
+            # Map quantization -> stage: fp32 = before, int8/int4 = after
+            df_cuda["quant_stage"] = df_cuda["quantization"].apply(
+                lambda q: "before" if q == "fp32" else "after"
+            )
 
-        lat_chart = base.mark_bar().encode(
-            y=alt.Y("avg_latency_sec:Q", title="Avg latency (s)"),
-        ).properties(title="Latency by model & quantization")
+            # Average over multiple runs of the same (task, model, stage)
+            def make_stage_df(metric_col: str) -> pd.DataFrame:
+                return (
+                    df_cuda.groupby(
+                        ["task", "model_name", "quant_stage"], as_index=False
+                    )[metric_col]
+                    .mean()
+                )
 
-        co2_chart = base.mark_bar().encode(
-            y=alt.Y("emissions_kg:Q", title="Emissions (kg CO₂)"),
-        ).properties(title="Emissions by model & quantization")
+            acc_stage = make_stage_df("accuracy")
+            lat_stage = make_stage_df("avg_latency_sec")
+            co2_stage = make_stage_df("emissions_kg")
 
-        st.altair_chart(acc_chart, use_container_width=True)
-        st.altair_chart(lat_chart, use_container_width=True)
-        st.altair_chart(co2_chart, use_container_width=True)
+            # Helper to build a facet chart: one panel per task,
+            # line connecting "before" -> "after" for each model.
+            def stage_chart(data, y_field, y_title, y_format):
+                base = (
+                    alt.Chart(data)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X(
+                            "quant_stage:N",
+                            title="Quantization Stage",
+                            sort=["before", "after"],
+                        ),
+                        y=alt.Y(
+                            f"{y_field}:Q",
+                            title=y_title,
+                            axis=alt.Axis(format=y_format),
+                        ),
+                        color=alt.Color("model_name:N", title="Model"),
+                        tooltip=[
+                            alt.Tooltip("task:N", title="Task"),
+                            alt.Tooltip("model_name:N", title="Model"),
+                            alt.Tooltip("quant_stage:N", title="Stage"),
+                            alt.Tooltip(
+                                f"{y_field}:Q", title=y_title, format=y_format
+                            ),
+                        ],
+                    )
+                    .properties(width=220, height=220)
+                )
+                return base.facet(column=alt.Column("task:N", title="Task"))
+
+            st.markdown("#### Before vs After Quantization (CUDA runs)")
+
+            st.markdown("**Accuracy: Before vs After Quantization**")
+            acc_chart = stage_chart(
+                acc_stage, "accuracy", "Accuracy", ".4f"
+            )  # 4 decimal places
+            st.altair_chart(acc_chart, use_container_width=True)
+
+            st.markdown("**Latency: Before vs After Quantization**")
+            lat_chart = stage_chart(
+                lat_stage,
+                "avg_latency_sec",
+                "Avg Latency (s)",
+                ".6f",  # higher precision
+            )
+            st.altair_chart(lat_chart, use_container_width=True)
+
+            st.markdown("**Emissions: Before vs After Quantization**")
+            co2_chart = stage_chart(
+                co2_stage,
+                "emissions_kg",
+                "CO₂ Emissions (kg)",
+                ".8f",  # very fine precision
+            )
+            st.altair_chart(co2_chart, use_container_width=True)
     else:
         st.info("No rows match the selected filters.")
