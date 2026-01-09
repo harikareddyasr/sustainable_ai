@@ -95,16 +95,15 @@ def load_model_and_tokenizer(task: str, model_name: str, quantization: str):
     eager_kwargs = {"attn_implementation": "eager"}
 
     if quantization == "fp32":
-        model = ModelCls.from_pretrained(model_name, use_safetensors=True, **eager_kwargs)
+        model = ModelCls.from_pretrained(model_name, **eager_kwargs)
         model.to("cuda")
     elif quantization == "fp16":
-        model = ModelCls.from_pretrained(model_name, use_safetensors=True, **eager_kwargs)
+        model = ModelCls.from_pretrained(model_name, **eager_kwargs)
         model.to("cuda", dtype=torch.float16)
     elif quantization == "int8":
         bnb = BitsAndBytesConfig(load_in_8bit=True)
         model = ModelCls.from_pretrained(
             model_name,
-            use_safetensors=True,
             quantization_config=bnb,
             device_map="cuda:0",
         )
@@ -117,7 +116,6 @@ def load_model_and_tokenizer(task: str, model_name: str, quantization: str):
         )
         model = ModelCls.from_pretrained(
             model_name,
-            use_safetensors=True,
             quantization_config=bnb,
             device_map="cuda:0",
         )
